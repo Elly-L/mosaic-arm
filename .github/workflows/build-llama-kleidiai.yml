@@ -251,3 +251,115 @@ jobs:
             benchmark-results/thread-scaling-kleidiai.json
             benchmark-results/thread-scaling-no-kleidiai.json
           if-no-files-found: error
+
+      - name: Run interleaved KleidiAI A-B test
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          RESULT_DIR="benchmark-results/interleaved"
+          MODEL="bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M"
+
+          mkdir -p "$RESULT_DIR"
+
+          echo "round,order_position,mode,file" \
+            > "$RESULT_DIR/manifest.csv"
+
+          run_benchmark() {
+            local round="$1"
+            local position="$2"
+            local mode="$3"
+            local binary="$4"
+            local output_file="$RESULT_DIR/round-${round}-${mode}.json"
+
+            echo ""
+            echo "===== ROUND ${round} POSITION ${position}: ${mode} ====="
+
+            "$binary" \
+              -hf "$MODEL" \
+              --threads 4 \
+              --n-prompt 128 \
+              --n-gen 64 \
+              --repetitions 3 \
+              --output json \
+              > "$output_file"
+
+            echo "${round},${position},${mode},${output_file}" \
+              >> "$RESULT_DIR/manifest.csv"
+          }
+
+          for round in $(seq 1 8); do
+            if (( round % 2 == 1 )); then
+              run_benchmark "$round" 1 "kleidiai-on" \
+                "llama.cpp/build/bin/llama-bench"
+
+              sleep 2
+
+              run_benchmark "$round" 2 "kleidiai-off" \
+                "llama.cpp/build-no-kleidiai/bin/llama-bench"
+            else
+              run_benchmark "$round" 1 "kleidiai-off" \
+                "llama.cpp/build-no-kleidiai/bin/llama-bench"
+
+              sleep 2
+
+              run_benchmark "$round" 2 "kleidiai-on" \
+                "llama.cpp/build/bin/llama-bench"
+            fi
+
+            sleep 2
+          done
+
+          python3 - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+
+          result_dir = Path("benchmark-results/interleaved")
+          rows = []
+
+          with (result_dir / "manifest.csv").open(newline="") as handle:
+              manifest = csv.DictReader(handle)
+
+              for item in manifest:
+                  with Path(item["file"]).open() as benchmark_file:
+                      results = json.load(benchmark_file)
+
+                  prompt = next(
+                      result for result in results
+                      if result["n_prompt"] > 0
+                  )
+                  generation = next(
+                      result for result in results
+                      if result["n_gen"] > 0
+                  )
+
+                  rows.append({
+                      "round": item["round"],
+                      "order_position": item["order_position"],
+                      "mode": item["mode"],
+                      "prompt_tokens_per_second": prompt["avg_ts"],
+                      "prompt_stddev": prompt["stddev_ts"],
+                      "generation_tokens_per_second": generation["avg_ts"],
+                      "generation_stddev": generation["stddev_ts"],
+                  })
+
+          output_path = result_dir / "interleaved-summary.csv"
+
+          with output_path.open("w", newline="") as handle:
+              writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print("===== INTERLEAVED A-B SUMMARY =====")
+          print(output_path.read_text())
+          print("===== INTERLEAVED A-B SUCCESS =====")
+          PY
+
+
+      - name: Upload interleaved A-B results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smollm2-kleidiai-interleaved-ab
+          path: benchmark-results/interleaved/
+          if-no-files-found: error
