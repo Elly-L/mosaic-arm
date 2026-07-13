@@ -205,3 +205,49 @@ jobs:
           name: smollm2-arm64-no-kleidiai
           path: benchmark-results/smollm2-no-kleidiai.json
           if-no-files-found: error
+
+      - name: Benchmark thread scaling
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p benchmark-results
+
+          echo "===== KLEIDIAI THREAD SCALING ====="
+
+          llama.cpp/build/bin/llama-bench \
+            -hf bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M \
+            --threads 1,2,4 \
+            --n-prompt 128 \
+            --n-gen 64 \
+            --repetitions 5 \
+            --output json \
+            > benchmark-results/thread-scaling-kleidiai.json
+
+          cat benchmark-results/thread-scaling-kleidiai.json
+
+          echo ""
+          echo "===== NON-KLEIDIAI THREAD SCALING ====="
+
+          llama.cpp/build-no-kleidiai/bin/llama-bench \
+            -hf bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M \
+            --threads 1,2,4 \
+            --n-prompt 128 \
+            --n-gen 64 \
+            --repetitions 5 \
+            --output json \
+            > benchmark-results/thread-scaling-no-kleidiai.json
+
+          cat benchmark-results/thread-scaling-no-kleidiai.json
+
+          echo ""
+          echo "===== THREAD SCALING SUCCESS ====="
+
+      - name: Upload thread scaling results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smollm2-arm64-thread-scaling
+          path: |
+            benchmark-results/thread-scaling-kleidiai.json
+            benchmark-results/thread-scaling-no-kleidiai.json
+          if-no-files-found: error
