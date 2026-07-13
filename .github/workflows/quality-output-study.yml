@@ -1,0 +1,370 @@
+name: Q4 vs Q8 Quality Output Study
+
+on:
+  workflow_dispatch:
+
+jobs:
+  collect:
+    name: Collect deterministic model outputs
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Verify Arm64 environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          uname -m
+          lscpu | grep -E "Architecture|Model name|CPU\(s\)"
+          free -h
+          df -h /
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            pkg-config \
+            libcurl4-openssl-dev
+
+      - name: Build llama-server with KleidiAI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git
+
+          cmake \
+            -S llama.cpp \
+            -B llama.cpp/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_NATIVE=ON
+
+          cmake \
+            --build llama.cpp/build \
+            --target llama-server \
+            --parallel 4
+
+          echo "===== BUILD CONFIGURATION ====="
+
+          grep \
+            "^GGML_CPU_KLEIDIAI:" \
+            llama.cpp/build/CMakeCache.txt
+
+          llama.cpp/build/bin/llama-server --version
+
+      - name: Create fixed evaluation cases
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p quality-results
+
+          cat > quality-results/cases.json <<'JSON'
+          [
+            {
+              "id": "factual_01",
+              "category": "factual",
+              "prompt": "What is the capital city of Kenya? Respond with the city name only."
+            },
+            {
+              "id": "arithmetic_01",
+              "category": "arithmetic",
+              "prompt": "A store had 48 notebooks. It sold 19 and then received 7 new notebooks. How many notebooks does it have now? Respond with the number only."
+            },
+            {
+              "id": "logic_01",
+              "category": "logic",
+              "prompt": "Every Zuri is a Tamu. No Tamu is a Pendo. Can any Zuri be a Pendo? Respond with either YES or NO, followed by one short sentence explaining why."
+            },
+            {
+              "id": "summary_01",
+              "category": "summarization",
+              "prompt": "Summarize the following passage in exactly one sentence: A community library extended its opening hours from six to ten hours per day. During the following month, student visits increased by 40 percent, while electricity costs increased by 12 percent. The library board decided to retain the longer schedule because the increase in educational access outweighed the additional operating cost."
+            },
+            {
+              "id": "extraction_01",
+              "category": "structured extraction",
+              "prompt": "Extract the following information as valid JSON with exactly these keys: name, city, role, years_experience. Text: Amina Wekesa is a software engineer based in Nairobi with three years of experience. Return JSON only."
+            },
+            {
+              "id": "instruction_01",
+              "category": "instruction following",
+              "prompt": "Give exactly three benefits of CPU-based AI inference. Use exactly three bullet points. Each bullet must contain no more than six words."
+            },
+            {
+              "id": "swahili_01",
+              "category": "translation",
+              "prompt": "Translate this sentence into natural Swahili: The system selects the fastest model that still meets the required quality. Return only the translation."
+            },
+            {
+              "id": "coding_01",
+              "category": "coding",
+              "prompt": "Write a Python function named clamp that accepts value, minimum, and maximum, and returns value restricted to that range. Return code only, without Markdown fences."
+            }
+          ]
+          JSON
+
+          python3 -m json.tool quality-results/cases.json
+
+      - name: Run Q4 and Q8 quality collection
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          SERVER_BIN="llama.cpp/build/bin/llama-server"
+          REPOSITORY="bartowski/SmolLM2-1.7B-Instruct-GGUF"
+          PORT="8080"
+
+          run_quantization() {
+            local quantization="$1"
+            local result_dir="quality-results/${quantization}"
+            local log_file="${result_dir}/server.log"
+
+            mkdir -p "$result_dir"
+
+            echo ""
+            echo "===== STARTING ${quantization} SERVER ====="
+
+            "$SERVER_BIN" \
+              -hf "${REPOSITORY}:${quantization}" \
+              --host 127.0.0.1 \
+              --port "$PORT" \
+              --threads 4 \
+              --ctx-size 4096 \
+              > "$log_file" 2>&1 &
+
+            local server_pid=$!
+
+            cleanup_server() {
+              if kill -0 "$server_pid" 2>/dev/null; then
+                kill "$server_pid" || true
+                wait "$server_pid" || true
+              fi
+            }
+
+            trap cleanup_server RETURN
+
+            echo "Waiting for ${quantization} to load..."
+
+            ready="false"
+
+            for attempt in $(seq 1 120); do
+              if curl \
+                --silent \
+                --fail \
+                "http://127.0.0.1:${PORT}/health" \
+                > "${result_dir}/health.json"; then
+                ready="true"
+                break
+              fi
+
+              if ! kill -0 "$server_pid" 2>/dev/null; then
+                echo "Server exited before becoming ready."
+                cat "$log_file"
+                exit 1
+              fi
+
+              sleep 2
+            done
+
+            if [[ "$ready" != "true" ]]; then
+              echo "Server did not become ready."
+              cat "$log_file"
+              exit 1
+            fi
+
+            echo "${quantization} server is ready."
+
+            QUANTIZATION="$quantization" PORT="$PORT" python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+
+          quantization = os.environ["QUANTIZATION"]
+          port = os.environ["PORT"]
+
+          root = Path("quality-results")
+          output_dir = root / quantization
+          cases = json.loads((root / "cases.json").read_text())
+
+          records = []
+
+          for case in cases:
+              payload = {
+                  "model": "local-model",
+                  "messages": [
+                      {
+                          "role": "system",
+                          "content": (
+                              "Follow the user's requested output format exactly. "
+                              "Do not add introductions or unrelated commentary."
+                          ),
+                      },
+                      {
+                          "role": "user",
+                          "content": case["prompt"],
+                      },
+                  ],
+                  "temperature": 0,
+                  "seed": 42,
+                  "max_tokens": 192,
+                  "stream": False,
+              }
+
+              request = urllib.request.Request(
+                  f"http://127.0.0.1:{port}/v1/chat/completions",
+                  data=json.dumps(payload).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+
+              started = time.perf_counter()
+
+              try:
+                  with urllib.request.urlopen(request, timeout=180) as response:
+                      raw = json.loads(response.read().decode("utf-8"))
+              except urllib.error.HTTPError as error:
+                  body = error.read().decode("utf-8", errors="replace")
+                  raise RuntimeError(
+                      f"HTTP {error.code} for {case['id']}: {body}"
+                  ) from error
+
+              elapsed_ms = round(
+                  (time.perf_counter() - started) * 1000,
+                  3,
+              )
+
+              content = raw["choices"][0]["message"]["content"]
+
+              record = {
+                  "id": case["id"],
+                  "category": case["category"],
+                  "quantization": quantization,
+                  "prompt": case["prompt"],
+                  "answer": content.strip(),
+                  "elapsed_ms": elapsed_ms,
+                  "usage": raw.get("usage", {}),
+                  "timings": raw.get("timings", {}),
+              }
+
+              records.append(record)
+
+              individual_path = output_dir / f"{case['id']}.json"
+              individual_path.write_text(
+                  json.dumps(record, indent=2, ensure_ascii=False)
+                  + "\n"
+              )
+
+              print(
+                  f"{quantization} | {case['id']} | "
+                  f"{elapsed_ms} ms"
+              )
+
+          output_path = output_dir / "responses.json"
+
+          output_path.write_text(
+              json.dumps(records, indent=2, ensure_ascii=False)
+              + "\n"
+          )
+          PY
+
+            cleanup_server
+            trap - RETURN
+
+            echo "===== ${quantization} COLLECTION SUCCESS ====="
+          }
+
+          run_quantization "Q4_K_M"
+          run_quantization "Q8_0"
+
+          echo "===== BOTH QUANTIZATIONS COMPLETE ====="
+
+      - name: Generate side-by-side report
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("quality-results")
+
+          q4 = {
+              row["id"]: row
+              for row in json.loads(
+                  (root / "Q4_K_M" / "responses.json").read_text()
+              )
+          }
+
+          q8 = {
+              row["id"]: row
+              for row in json.loads(
+                  (root / "Q8_0" / "responses.json").read_text()
+              )
+          }
+
+          cases = json.loads((root / "cases.json").read_text())
+
+          def markdown_text(value):
+              return (
+                  value.replace("|", "\\|")
+                  .replace("\r\n", "\n")
+                  .replace("\n", "<br>")
+              )
+
+          lines = [
+              "# SmolLM2-1.7B Q4_K_M vs Q8_0",
+              "",
+              "Deterministic settings: temperature 0, seed 42.",
+              "",
+              "| Case | Category | Q4_K_M answer | Q8_0 answer |",
+              "|---|---|---|---|",
+          ]
+
+          for case in cases:
+              case_id = case["id"]
+
+              lines.append(
+                  "| "
+                  + markdown_text(case_id)
+                  + " | "
+                  + markdown_text(case["category"])
+                  + " | "
+                  + markdown_text(q4[case_id]["answer"])
+                  + " | "
+                  + markdown_text(q8[case_id]["answer"])
+                  + " |"
+              )
+
+          report = "\n".join(lines) + "\n"
+
+          report_path = root / "side-by-side.md"
+          report_path.write_text(report)
+
+          print("===== QUALITY OUTPUT SUMMARY =====")
+          print(report)
+          print("===== QUALITY OUTPUT COLLECTION SUCCESS =====")
+          PY
+
+      - name: Upload quality outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: smollm2-q4-vs-q8-quality-outputs
+          path: quality-results/
+          if-no-files-found: error
