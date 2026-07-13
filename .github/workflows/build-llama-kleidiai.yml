@@ -99,8 +99,9 @@ jobs:
           echo "===== LLAMA CLI VERSION ====="
           llama.cpp/build/bin/llama-cli --version
 
-          echo "===== LLAMA BENCH VERSION ====="
-          llama.cpp/build/bin/llama-bench --version
+          echo "===== LLAMA BENCH VERIFICATION ====="
+          llama.cpp/build/bin/llama-bench --help > /tmp/llama-bench-help.txt 2>&1
+          head -20 /tmp/llama-bench-help.txt
 
           echo "===== BUILD SUCCESS ====="
           echo "llama.cpp compiled successfully on native Arm64 with KleidiAI enabled."
