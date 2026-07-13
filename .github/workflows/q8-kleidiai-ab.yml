@@ -1,0 +1,183 @@
+name: Q8 KleidiAI A-B Study
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            pkg-config \
+            libcurl4-openssl-dev
+
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git
+
+      - name: Build KleidiAI ON and OFF
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            -S llama.cpp \
+            -B llama.cpp/build-on \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_NATIVE=ON
+
+          cmake \
+            --build llama.cpp/build-on \
+            --target llama-bench \
+            --parallel 4
+
+          cmake \
+            -S llama.cpp \
+            -B llama.cpp/build-off \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU_KLEIDIAI=OFF \
+            -DGGML_NATIVE=ON
+
+          cmake \
+            --build llama.cpp/build-off \
+            --target llama-bench \
+            --parallel 4
+
+          echo "===== CONFIGURATIONS ====="
+          grep "^GGML_CPU_KLEIDIAI:" \
+            llama.cpp/build-on/CMakeCache.txt
+
+          grep "^GGML_CPU_KLEIDIAI:" \
+            llama.cpp/build-off/CMakeCache.txt
+
+      - name: Run interleaved Q8 A-B benchmark
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          RESULT_DIR="benchmark-results/q8-ab"
+          MODEL="bartowski/SmolLM2-1.7B-Instruct-GGUF:Q8_0"
+
+          mkdir -p "$RESULT_DIR"
+
+          echo "round,position,mode,file" \
+            > "$RESULT_DIR/manifest.csv"
+
+          run_test() {
+            local round="$1"
+            local position="$2"
+            local mode="$3"
+            local binary="$4"
+            local output="$RESULT_DIR/round-${round}-${mode}.json"
+
+            "$binary" \
+              -hf "$MODEL" \
+              --threads 4 \
+              --n-prompt 128 \
+              --n-gen 64 \
+              --repetitions 3 \
+              --output json \
+              > "$output"
+
+            echo "$round,$position,$mode,$output" \
+              >> "$RESULT_DIR/manifest.csv"
+
+            sleep 2
+          }
+
+          for round in $(seq 1 6); do
+            if (( round % 2 == 1 )); then
+              run_test "$round" 1 "kleidiai-on" \
+                llama.cpp/build-on/bin/llama-bench
+
+              run_test "$round" 2 "kleidiai-off" \
+                llama.cpp/build-off/bin/llama-bench
+            else
+              run_test "$round" 1 "kleidiai-off" \
+                llama.cpp/build-off/bin/llama-bench
+
+              run_test "$round" 2 "kleidiai-on" \
+                llama.cpp/build-on/bin/llama-bench
+            fi
+          done
+
+      - name: Summarize Q8 results
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import csv
+          import json
+          import statistics
+          from collections import defaultdict
+          from pathlib import Path
+
+          directory = Path("benchmark-results/q8-ab")
+          grouped = defaultdict(list)
+
+          with (directory / "manifest.csv").open(newline="") as handle:
+              for item in csv.DictReader(handle):
+                  with Path(item["file"]).open() as source:
+                      results = json.load(source)
+
+                  prompt = next(
+                      row for row in results
+                      if row["n_prompt"] > 0
+                  )
+
+                  generation = next(
+                      row for row in results
+                      if row["n_gen"] > 0
+                  )
+
+                  grouped[item["mode"]].append({
+                      "prompt": prompt["avg_ts"],
+                      "generation": generation["avg_ts"],
+                  })
+
+          print("===== Q8 KLEIDIAI A-B SUMMARY =====")
+
+          for mode in ("kleidiai-on", "kleidiai-off"):
+              values = grouped[mode]
+
+              print(
+                  f"{mode},"
+                  f"prompt_mean="
+                  f"{statistics.mean(v['prompt'] for v in values):.4f},"
+                  f"prompt_median="
+                  f"{statistics.median(v['prompt'] for v in values):.4f},"
+                  f"generation_mean="
+                  f"{statistics.mean(v['generation'] for v in values):.4f},"
+                  f"generation_median="
+                  f"{statistics.median(v['generation'] for v in values):.4f}"
+              )
+
+          print("===== Q8 KLEIDIAI A-B SUCCESS =====")
+          PY
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: q8-kleidiai-ab-study
+          path: benchmark-results/q8-ab/
+          if-no-files-found: error
