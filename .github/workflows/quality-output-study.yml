@@ -362,6 +362,478 @@ jobs:
           print("===== QUALITY OUTPUT COLLECTION SUCCESS =====")
           PY
 
+      - name: Score quality outputs automatically
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import ast
+          import csv
+          import json
+          import re
+          from pathlib import Path
+
+          ROOT = Path("quality-results")
+          QUANTIZATIONS = ("Q4_K_M", "Q8_0")
+
+          def normalize(text):
+              return re.sub(r"\s+", " ", text.strip()).casefold()
+
+          def strip_code_fences(text):
+              lines = text.strip().splitlines()
+
+              if lines and lines[0].strip().startswith("```"):
+                  lines = lines[1:]
+
+              if lines and lines[-1].strip() == "```":
+                  lines = lines[:-1]
+
+              return "\n".join(lines).strip()
+
+          def score_factual(answer):
+              correct = normalize(answer) == "nairobi"
+              return correct, correct, "Expected exactly: Nairobi"
+
+          def score_arithmetic(answer):
+              normalized = normalize(answer)
+
+              correct = normalized == "36"
+              format_ok = bool(re.fullmatch(r"36", normalized))
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected number-only answer: 36",
+              )
+
+          def score_logic(answer):
+              normalized = normalize(answer)
+
+              starts_no = normalized.startswith("no")
+              has_explanation = len(normalized.split()) > 4
+              mentions_relationship = (
+                  "tamu" in normalized
+                  and "pendo" in normalized
+              )
+
+              correct = (
+                  starts_no
+                  and mentions_relationship
+              )
+
+              format_ok = (
+                  starts_no
+                  and has_explanation
+                  and mentions_relationship
+              )
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected NO followed by a short explanation.",
+              )
+
+          def score_summary(answer):
+              normalized = normalize(answer)
+
+              required = (
+                  "40" in normalized
+                  and "12" in normalized
+                  and "student" in normalized
+                  and (
+                      "electricity" in normalized
+                      or "operating cost" in normalized
+                  )
+                  and (
+                      "retain" in normalized
+                      or "longer schedule" in normalized
+                      or "longer hours" in normalized
+                  )
+              )
+
+              sentence_endings = re.findall(
+                  r"[.!?](?:\s|$)",
+                  answer.strip(),
+              )
+
+              one_sentence = len(sentence_endings) <= 1
+
+              return (
+                  required,
+                  one_sentence,
+                  "Expected one sentence preserving the main facts.",
+              )
+
+          def score_extraction(answer):
+              try:
+                  parsed = json.loads(answer)
+              except json.JSONDecodeError:
+                  return (
+                      False,
+                      False,
+                      "Response is not valid JSON.",
+                  )
+
+              expected = {
+                  "name": "Amina Wekesa",
+                  "city": "Nairobi",
+                  "role": "software engineer",
+                  "years_experience": 3,
+              }
+
+              correct = parsed == expected
+
+              format_ok = (
+                  isinstance(parsed, dict)
+                  and list(parsed.keys())
+                  == [
+                      "name",
+                      "city",
+                      "role",
+                      "years_experience",
+                  ]
+              )
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected exact keys and extracted values.",
+              )
+
+          def score_instruction(answer):
+              bullet_lines = [
+                  line.strip()
+                  for line in answer.splitlines()
+                  if line.strip().startswith(("-", "*"))
+              ]
+
+              exactly_three = len(bullet_lines) == 3
+
+              lengths_valid = all(
+                  len(
+                      re.findall(
+                          r"\b[\w'-]+\b",
+                          re.sub(r"^[-*]\s*", "", line),
+                      )
+                  ) <= 6
+                  for line in bullet_lines
+              )
+
+              nonempty = all(
+                  re.sub(r"^[-*]\s*", "", line).strip()
+                  for line in bullet_lines
+              )
+
+              correct = exactly_three and nonempty
+              format_ok = exactly_three and lengths_valid
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected exactly three bullets of six words or fewer.",
+              )
+
+          def score_swahili(answer):
+              normalized = normalize(answer)
+
+              original = normalize(
+                  "The system selects the fastest model that still "
+                  "meets the required quality."
+              )
+
+              has_system = "mfumo" in normalized
+              has_model = "modeli" in normalized
+
+              has_selection = any(
+                  word in normalized
+                  for word in (
+                      "huchagua",
+                      "inachagua",
+                      "unachagua",
+                      "huteua",
+                      "inateua",
+                  )
+              )
+
+              has_speed = any(
+                  word in normalized
+                  for word in (
+                      "haraka",
+                      "kasi",
+                      "ya kasi zaidi",
+                  )
+              )
+
+              has_quality = "ubora" in normalized
+
+              correct = (
+                  normalized != original
+                  and has_system
+                  and has_model
+                  and has_selection
+                  and has_speed
+                  and has_quality
+              )
+
+              format_ok = (
+                  "\n" not in answer.strip()
+                  and not answer.strip().startswith("```")
+              )
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected a Swahili-only translation.",
+              )
+
+          def score_coding(answer):
+              raw = answer.strip()
+
+              format_ok = (
+                  not raw.startswith("```")
+                  and not raw.endswith("```")
+              )
+
+              code = strip_code_fences(raw)
+
+              try:
+                  tree = ast.parse(code)
+              except SyntaxError:
+                  return (
+                      False,
+                      format_ok,
+                      "Returned code could not be parsed.",
+                  )
+
+              unsafe = False
+
+              for node in ast.walk(tree):
+                  if isinstance(
+                      node,
+                      (
+                          ast.Import,
+                          ast.ImportFrom,
+                          ast.Attribute,
+                          ast.ClassDef,
+                          ast.Lambda,
+                          ast.For,
+                          ast.While,
+                          ast.With,
+                          ast.Try,
+                          ast.Global,
+                          ast.Nonlocal,
+                      ),
+                  ):
+                      unsafe = True
+
+                  if isinstance(node, ast.Call):
+                      if not (
+                          isinstance(node.func, ast.Name)
+                          and node.func.id in {"min", "max"}
+                      ):
+                          unsafe = True
+
+              functions = [
+                  node
+                  for node in tree.body
+                  if isinstance(node, ast.FunctionDef)
+              ]
+
+              if len(functions) != 1 or unsafe:
+                  return (
+                      False,
+                      format_ok,
+                      "Expected one safe clamp function.",
+                  )
+
+              function = functions[0]
+
+              argument_names = [
+                  argument.arg
+                  for argument in function.args.args
+              ]
+
+              signature_ok = (
+                  function.name == "clamp"
+                  and argument_names
+                  == ["value", "minimum", "maximum"]
+              )
+
+              behavior_ok = False
+
+              if signature_ok:
+                  environment = {
+                      "__builtins__": {
+                          "min": min,
+                          "max": max,
+                      }
+                  }
+
+                  try:
+                      exec(
+                          compile(tree, "<model-output>", "exec"),
+                          environment,
+                          environment,
+                      )
+
+                      clamp = environment["clamp"]
+
+                      tests = (
+                          (5, 0, 10, 5),
+                          (-2, 0, 10, 0),
+                          (15, 0, 10, 10),
+                          (3.5, 1.0, 4.0, 3.5),
+                      )
+
+                      behavior_ok = all(
+                          clamp(value, minimum, maximum)
+                          == expected
+                          for (
+                              value,
+                              minimum,
+                              maximum,
+                              expected,
+                          ) in tests
+                      )
+                  except Exception:
+                      behavior_ok = False
+
+              correct = signature_ok and behavior_ok
+
+              return (
+                  correct,
+                  format_ok,
+                  "Expected code-only output and exact parameter names.",
+              )
+
+          SCORERS = {
+              "factual_01": score_factual,
+              "arithmetic_01": score_arithmetic,
+              "logic_01": score_logic,
+              "summary_01": score_summary,
+              "extraction_01": score_extraction,
+              "instruction_01": score_instruction,
+              "swahili_01": score_swahili,
+              "coding_01": score_coding,
+          }
+
+          all_results = []
+          summaries = []
+
+          for quantization in QUANTIZATIONS:
+              response_path = (
+                  ROOT
+                  / quantization
+                  / "responses.json"
+              )
+
+              responses = json.loads(
+                  response_path.read_text()
+              )
+
+              quantization_results = []
+
+              for response in responses:
+                  case_id = response["id"]
+                  scorer = SCORERS[case_id]
+
+                  correctness, format_ok, note = scorer(
+                      response["answer"]
+                  )
+
+                  result = {
+                      "quantization": quantization,
+                      "id": case_id,
+                      "category": response["category"],
+                      "correctness_pass": correctness,
+                      "format_pass": format_ok,
+                      "strict_pass": correctness and format_ok,
+                      "note": note,
+                      "answer": response["answer"],
+                  }
+
+                  quantization_results.append(result)
+                  all_results.append(result)
+
+              total = len(quantization_results)
+
+              correctness_total = sum(
+                  result["correctness_pass"]
+                  for result in quantization_results
+              )
+
+              format_total = sum(
+                  result["format_pass"]
+                  for result in quantization_results
+              )
+
+              strict_total = sum(
+                  result["strict_pass"]
+                  for result in quantization_results
+              )
+
+              summaries.append({
+                  "quantization": quantization,
+                  "total_cases": total,
+                  "correctness_passes": correctness_total,
+                  "format_passes": format_total,
+                  "strict_passes": strict_total,
+                  "correctness_percent": round(
+                      correctness_total / total * 100,
+                      2,
+                  ),
+                  "format_percent": round(
+                      format_total / total * 100,
+                      2,
+                  ),
+                  "strict_percent": round(
+                      strict_total / total * 100,
+                      2,
+                  ),
+              })
+
+          score_json = ROOT / "quality-scores.json"
+
+          score_json.write_text(
+              json.dumps(
+                  {
+                      "summaries": summaries,
+                      "case_results": all_results,
+                  },
+                  indent=2,
+                  ensure_ascii=False,
+              )
+              + "\n"
+          )
+
+          score_csv = ROOT / "quality-score-summary.csv"
+
+          with score_csv.open("w", newline="") as handle:
+              writer = csv.DictWriter(
+                  handle,
+                  fieldnames=summaries[0].keys(),
+              )
+
+              writer.writeheader()
+              writer.writerows(summaries)
+
+          print("===== AUTOMATIC QUALITY SCORE =====")
+          print(score_csv.read_text())
+
+          print("===== CASE RESULTS =====")
+
+          for result in all_results:
+              print(
+                  f"{result['quantization']} | "
+                  f"{result['id']} | "
+                  f"correct={result['correctness_pass']} | "
+                  f"format={result['format_pass']} | "
+                  f"strict={result['strict_pass']}"
+              )
+
+          print("===== AUTOMATIC QUALITY SCORING SUCCESS =====")
+          PY
       - name: Upload quality outputs
         uses: actions/upload-artifact@v4
         with:
