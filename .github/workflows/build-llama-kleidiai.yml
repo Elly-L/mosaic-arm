@@ -1,0 +1,106 @@
+name: Build llama.cpp with KleidiAI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build on native Arm64
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Display environment
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== ARCHITECTURE ====="
+          uname -m
+
+          echo "===== CPU MODEL ====="
+          lscpu | grep -E "Architecture|Model name|CPU\(s\)"
+
+          echo "===== MEMORY ====="
+          free -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            git \
+            pkg-config \
+            libcurl4-openssl-dev
+
+          echo "===== TOOL VERSIONS ====="
+          gcc --version | head -1
+          g++ --version | head -1
+          cmake --version | head -1
+          ninja --version
+          git --version
+
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git clone \
+            --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git
+
+          cd llama.cpp
+
+          echo "===== LLAMA.CPP COMMIT ====="
+          git rev-parse HEAD
+
+      - name: Configure with KleidiAI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            -S llama.cpp \
+            -B llama.cpp/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_NATIVE=ON
+
+          echo "===== KLEIDIAI CONFIGURATION ====="
+
+          grep \
+            "^GGML_CPU_KLEIDIAI:" \
+            llama.cpp/build/CMakeCache.txt
+
+      - name: Build llama-cli and llama-bench
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            --build llama.cpp/build \
+            --target llama-cli llama-bench \
+            --parallel 4
+
+      - name: Verify compiled binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -x llama.cpp/build/bin/llama-cli
+          test -x llama.cpp/build/bin/llama-bench
+
+          echo "===== LLAMA CLI VERSION ====="
+          llama.cpp/build/bin/llama-cli --version
+
+          echo "===== LLAMA BENCH VERSION ====="
+          llama.cpp/build/bin/llama-bench --version
+
+          echo "===== BUILD SUCCESS ====="
+          echo "llama.cpp compiled successfully on native Arm64 with KleidiAI enabled."
