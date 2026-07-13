@@ -105,3 +105,21 @@ jobs:
 
           echo "===== BUILD SUCCESS ====="
           echo "llama.cpp compiled successfully on native Arm64 with KleidiAI enabled."
+
+      - name: Run first Arm64 inference
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "===== FIRST ARM64 INFERENCE ====="
+
+          timeout 5m llama.cpp/build/bin/llama-cli \
+            -hf bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M \
+            --prompt "Write one short sentence confirming that AI inference is running successfully on an Arm64 CPU." \
+            --n-predict 48 \
+            --threads 4 \
+            --temp 0 \
+            --single-turn
+
+          echo ""
+          echo "===== INFERENCE SUCCESS ====="
