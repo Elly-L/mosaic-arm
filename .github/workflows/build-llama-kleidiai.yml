@@ -152,3 +152,49 @@ jobs:
           name: smollm2-arm64-baseline
           path: benchmark-results/smollm2-baseline.json
           if-no-files-found: error
+
+      - name: Build llama-bench without KleidiAI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cmake \
+            -S llama.cpp \
+            -B llama.cpp/build-no-kleidiai \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CPU_KLEIDIAI=OFF \
+            -DGGML_NATIVE=ON
+
+          echo "===== NON-KLEIDIAI CONFIGURATION ====="
+          grep \
+            "^GGML_CPU_KLEIDIAI:" \
+            llama.cpp/build-no-kleidiai/CMakeCache.txt
+
+          cmake \
+            --build llama.cpp/build-no-kleidiai \
+            --target llama-bench \
+            --parallel 4
+
+      - name: Benchmark without KleidiAI
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p benchmark-results
+
+          echo "===== NON-KLEIDIAI BENCHMARK ====="
+
+          llama.cpp/build-no-kleidiai/bin/llama-bench \
+            -hf bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M \
+            --threads 4 \
+            --n-prompt 128 \
+            --n-gen 64 \
+            --repetitions 5 \
+            --output json \
+            > benchmark-results/smollm2-no-kleidiai.json
+
+          cat benchmark-results/smollm2-no-kleidiai.json
+
+          echo ""
+          echo "===== NON-KLEIDIAI BENCHMARK SUCCESS ====="
