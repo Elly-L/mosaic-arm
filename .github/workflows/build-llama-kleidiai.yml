@@ -198,3 +198,10 @@ jobs:
 
           echo ""
           echo "===== NON-KLEIDIAI BENCHMARK SUCCESS ====="
+
+      - name: Upload non-KleidiAI benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: smollm2-arm64-no-kleidiai
+          path: benchmark-results/smollm2-no-kleidiai.json
+          if-no-files-found: error
