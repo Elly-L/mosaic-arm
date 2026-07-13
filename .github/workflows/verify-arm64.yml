@@ -1,0 +1,36 @@
+name: Verify Arm64 Environment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  verify-arm64:
+    name: Verify native Arm64 runner
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Display Arm64 system information
+        shell: bash
+        run: |
+          echo "===== ARCHITECTURE ====="
+          uname -m
+
+          echo ""
+          echo "===== OPERATING SYSTEM ====="
+          cat /etc/os-release
+
+          echo ""
+          echo "===== CPU ====="
+          lscpu
+
+          echo ""
+          echo "===== MEMORY ====="
+          free -h
+
+          echo ""
+          echo "===== STORAGE ====="
+          df -h /
+
+          echo ""
+          echo "===== PROCESSOR COUNT ====="
+          nproc
