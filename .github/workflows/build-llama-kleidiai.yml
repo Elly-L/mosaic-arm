@@ -123,3 +123,32 @@ jobs:
 
           echo ""
           echo "===== INFERENCE SUCCESS ====="
+
+      - name: Benchmark first Arm64 model
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p benchmark-results
+
+          echo "===== BASELINE BENCHMARK ====="
+
+          llama.cpp/build/bin/llama-bench \
+            -hf bartowski/SmolLM2-360M-Instruct-GGUF:Q4_K_M \
+            --threads 4 \
+            --n-prompt 128 \
+            --n-gen 64 \
+            --repetitions 5 \
+            --output json \
+            > benchmark-results/smollm2-baseline.json
+
+          cat benchmark-results/smollm2-baseline.json
+
+          echo ""
+          echo "===== BASELINE BENCHMARK SUCCESS ====="
+      - name: Upload baseline benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: smollm2-arm64-baseline
+          path: benchmark-results/smollm2-baseline.json
+          if-no-files-found: error
