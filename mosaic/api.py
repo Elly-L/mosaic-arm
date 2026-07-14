@@ -145,8 +145,9 @@ def load_current_dataset() -> dict[str, Any]:
     "/health",
     tags=["System"],
     summary="Check API readiness",
+    response_model=None,
 )
-def health() -> dict[str, Any] | JSONResponse:
+def health() -> Any:
     candidate_file = candidates_path()
     proof_report = report_path()
 
