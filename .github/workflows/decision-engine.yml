@@ -1,0 +1,100 @@
+name: MOSAIC Decision Engine
+
+on:
+  workflow_dispatch:
+
+jobs:
+  select:
+    name: Select optimized Arm64 configurations
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run decision profiles
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p decision-results
+
+          for objective in latency memory balanced; do
+            python3 mosaic/decision_engine.py \
+              --data data/candidates.json \
+              --objective "$objective" \
+              --quality-floor 50 \
+              --output "decision-results/${objective}-quality-50.json"
+          done
+
+          python3 mosaic/decision_engine.py \
+            --data data/candidates.json \
+            --objective latency \
+            --quality-floor 60 \
+            --output decision-results/latency-quality-60.json
+
+      - name: Validate expected selections
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          directory = Path("decision-results")
+
+          expected = {
+              "latency-quality-50.json": "smollm2-1.7b-q8-0",
+              "memory-quality-50.json": "smollm2-1.7b-q4-k-m",
+              "balanced-quality-50.json": "smollm2-1.7b-q8-0",
+              "latency-quality-60.json": "smollm2-1.7b-q4-k-m",
+          }
+
+          print("===== MOSAIC DECISION SUMMARY =====")
+
+          for filename, expected_id in expected.items():
+              path = directory / filename
+              result = json.loads(path.read_text())
+
+              selected = result["selected_configuration"]
+
+              if selected is None:
+                  raise AssertionError(
+                      f"{filename}: no configuration selected"
+                  )
+
+              actual_id = selected["id"]
+
+              if actual_id != expected_id:
+                  raise AssertionError(
+                      f"{filename}: expected {expected_id}, "
+                      f"received {actual_id}"
+                  )
+
+              print(
+                  f"{filename}: "
+                  f"{actual_id} "
+                  f"({selected['quantization']})"
+              )
+
+          print("===== MOSAIC DECISION ENGINE SUCCESS =====")
+          PY
+
+      - name: Display complete decisions
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          for file in decision-results/*.json; do
+            echo ""
+            echo "===== $file ====="
+            cat "$file"
+          done
+
+      - name: Upload decision outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosaic-decision-results
+          path: decision-results/
+          if-no-files-found: error
