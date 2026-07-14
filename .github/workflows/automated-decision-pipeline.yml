@@ -6,6 +6,7 @@ on:
 permissions:
   actions: read
   contents: read
+  packages: write
 
 jobs:
   generate-and-select:
@@ -1158,6 +1159,300 @@ jobs:
           echo "===== CONTAINER LOG ====="
 
           docker logs mosaic-arm-ci
+      
+            - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish tested Arm64 image to GHCR
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHA_TAG="sha-${GITHUB_SHA::12}"
+
+          docker tag \
+            mosaic-arm:ci \
+            "$IMAGE_NAME:latest"
+
+          docker tag \
+            mosaic-arm:ci \
+            "$IMAGE_NAME:arm64"
+
+          docker tag \
+            mosaic-arm:ci \
+            "$IMAGE_NAME:$SHA_TAG"
+
+          docker push "$IMAGE_NAME:latest"
+          docker push "$IMAGE_NAME:arm64"
+          docker push "$IMAGE_NAME:$SHA_TAG"
+
+          docker pull "$IMAGE_NAME:latest"
+
+          REPOSITORY_DIGEST="$(
+            docker image inspect \
+              "$IMAGE_NAME:latest" \
+              --format '{{index .RepoDigests 0}}'
+          )"
+
+          if [[ -z "$REPOSITORY_DIGEST" ]]; then
+            echo "GHCR did not return an image digest."
+            exit 1
+          fi
+
+          IMAGE_DIGEST="${REPOSITORY_DIGEST#*@}"
+
+          if [[ "$IMAGE_DIGEST" != sha256:* ]]; then
+            echo \
+              "Unexpected image digest: $IMAGE_DIGEST"
+            exit 1
+          fi
+
+          echo \
+            "PUBLISHED_IMAGE=$IMAGE_NAME" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "PUBLISHED_SHA_TAG=$SHA_TAG" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "PUBLISHED_DIGEST=$IMAGE_DIGEST" \
+            >> "$GITHUB_ENV"
+
+          echo "===== GHCR IMAGE PUBLISHED ====="
+          echo "Image: $IMAGE_NAME"
+          echo "Latest tag: $IMAGE_NAME:latest"
+          echo "Arm64 tag: $IMAGE_NAME:arm64"
+          echo "Commit tag: $IMAGE_NAME:$SHA_TAG"
+          echo "Digest: $IMAGE_DIGEST"
+
+      - name: Pull and validate published GHCR image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p generated/ghcr-tests
+
+          docker pull \
+            "$PUBLISHED_IMAGE@$PUBLISHED_DIGEST"
+
+          PULLED_ARCHITECTURE="$(
+            docker image inspect \
+              "$PUBLISHED_IMAGE@$PUBLISHED_DIGEST" \
+              --format '{{.Architecture}}'
+          )"
+
+          if [[ "$PULLED_ARCHITECTURE" != "arm64" ]]; then
+            echo \
+              "Expected arm64 image, received: $PULLED_ARCHITECTURE"
+            exit 1
+          fi
+
+          docker run \
+            --detach \
+            --name mosaic-ghcr-ci \
+            --publish 127.0.0.1:8002:8000 \
+            "$PUBLISHED_IMAGE@$PUBLISHED_DIGEST"
+
+          cleanup() {
+            docker logs \
+              mosaic-ghcr-ci \
+              > generated/ghcr-tests/container.log \
+              2>&1 \
+              || true
+
+            docker rm \
+              --force \
+              mosaic-ghcr-ci \
+              || true
+          }
+
+          trap cleanup EXIT
+
+          GHCR_CONTAINER_READY=false
+
+          for attempt in $(seq 1 30); do
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://127.0.0.1:8002/health \
+              > generated/ghcr-tests/health.json
+            then
+              GHCR_CONTAINER_READY=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [[ "$GHCR_CONTAINER_READY" != "true" ]]; then
+            echo \
+              "Published GHCR container did not become ready."
+
+            docker logs mosaic-ghcr-ci
+            exit 1
+          fi
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1:8002/ \
+            > generated/ghcr-tests/dashboard.html
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data '{
+              "objective": "latency",
+              "quality_floor_percent": 50
+            }' \
+            http://127.0.0.1:8002/api/recommend \
+            > generated/ghcr-tests/recommendation.json
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          directory = Path(
+              "generated/ghcr-tests"
+          )
+
+          health = json.loads(
+              (
+                  directory / "health.json"
+              ).read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          recommendation = json.loads(
+              (
+                  directory / "recommendation.json"
+              ).read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          dashboard_path = (
+              directory / "dashboard.html"
+          )
+
+          dashboard = dashboard_path.read_text(
+              encoding="utf-8"
+          )
+
+          if health["status"] != "ok":
+              raise AssertionError(
+                  f"Published image health failed: {health}"
+              )
+
+          if health["candidate_count"] != 3:
+              raise AssertionError(
+                  "Published image returned an "
+                  "unexpected candidate count."
+              )
+
+          selected = recommendation[
+              "selected_configuration"
+          ]
+
+          if (
+              selected is None
+              or selected["id"]
+              != "smollm2-1.7b-q8-0"
+          ):
+              raise AssertionError(
+                  "Published image should select "
+                  "Q8_0 at the 50% quality floor."
+              )
+
+          if (
+              "MOSAIC-Arm Optimizer"
+              not in dashboard
+          ):
+              raise AssertionError(
+                  "Published image dashboard is invalid."
+              )
+
+          image = os.environ[
+              "PUBLISHED_IMAGE"
+          ]
+
+          tag = os.environ[
+              "PUBLISHED_SHA_TAG"
+          ]
+
+          digest = os.environ[
+              "PUBLISHED_DIGEST"
+          ]
+
+          print(
+              "===== GHCR PUBLISH SUMMARY ====="
+          )
+
+          print(
+              "Image:",
+              image,
+          )
+
+          print(
+              "Commit tag:",
+              f"{image}:{tag}",
+          )
+
+          print(
+              "Digest:",
+              digest,
+          )
+
+          print(
+              "Architecture:",
+              "arm64",
+          )
+
+          print(
+              "Health:",
+              health["status"],
+          )
+
+          print(
+              "Selected configuration:",
+              selected["id"],
+          )
+
+          print(
+              "Dashboard bytes:",
+              dashboard_path.stat().st_size,
+          )
+
+          print(
+              "Pull command:",
+              f"docker pull {image}:latest",
+          )
+
+          print(
+              "Run command:",
+              (
+                  "docker run --rm -p 8000:8000 "
+                  f"{image}:latest"
+              ),
+          )
+
+          print(
+              "===== GHCR PUBLISH SUCCESS ====="
+          )
+          PY
       
       - name: Upload generated dataset and decisions
         uses: actions/upload-artifact@v4
