@@ -1,0 +1,251 @@
+name: Publish MOSAIC Multi-Arch Image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and publish AMD64 + ARM64 image
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Find latest successful MOSAIC pipeline run
+        id: source_run
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          RUN_ID="$(
+            gh run list \
+              --workflow automated-decision-pipeline.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId'
+          )"
+
+          if [[ -z "$RUN_ID" ]]; then
+            echo "No successful Automated MOSAIC Pipeline run found."
+            exit 1
+          fi
+
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using source workflow run: $RUN_ID"
+
+      - name: Download generated MOSAIC artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf artifact-download generated
+          mkdir -p artifact-download generated
+
+          gh run download \
+            "${{ steps.source_run.outputs.run_id }}" \
+            --name mosaic-automated-results \
+            --dir artifact-download
+
+          if [[ -f artifact-download/candidates.json ]]; then
+            cp -a artifact-download/. generated/
+          elif [[ -f artifact-download/generated/candidates.json ]]; then
+            cp -a artifact-download/generated/. generated/
+          else
+            echo "Could not find candidates.json in downloaded artifact."
+            find artifact-download -maxdepth 4 -type f | sort
+            exit 1
+          fi
+
+          test -f generated/candidates.json
+          test -f generated/report/optimization-proof-report.html
+
+          echo "===== RESTORED GENERATED FILES ====="
+          find generated -maxdepth 3 -type f | sort
+
+      - name: Prepare image metadata
+        id: image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHA_TAG="sha-${GITHUB_SHA::12}"
+
+          echo "name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Image: $IMAGE_NAME"
+          echo "Commit tag: $SHA_TAG"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-platform image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:multiarch
+            ${{ steps.image.outputs.name }}:${{ steps.image.outputs.sha_tag }}
+          labels: |
+            org.opencontainers.image.title=MOSAIC-Arm
+            org.opencontainers.image.description=Quality-aware inference optimization for Arm64 cloud CPUs
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify published multi-platform manifest
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euxo pipefail
+
+          docker buildx imagetools inspect \
+            "$IMAGE_NAME:latest"
+
+          docker buildx imagetools inspect \
+            --raw \
+            "$IMAGE_NAME:latest" \
+            > multiarch-manifest.json
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = json.loads(
+              Path("multiarch-manifest.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          platforms = {
+              (
+                  item.get("platform", {}).get("os"),
+                  item.get("platform", {}).get("architecture"),
+              )
+              for item in manifest.get("manifests", [])
+          }
+
+          required = {
+              ("linux", "amd64"),
+              ("linux", "arm64"),
+          }
+
+          missing = required - platforms
+
+          if missing:
+              raise AssertionError(
+                  f"Missing required image platforms: {sorted(missing)}; "
+                  f"found: {sorted(platforms)}"
+              )
+
+          print("===== MULTI-ARCH IMAGE SUMMARY =====")
+          print("Image:", os.environ["IMAGE_NAME"])
+          print("Digest:", os.environ["IMAGE_DIGEST"])
+          print("Platforms: linux/amd64, linux/arm64")
+          print(
+              "Pull command:",
+              f"docker pull {os.environ['IMAGE_NAME']}:latest",
+          )
+          print(
+              "Run command:",
+              "docker run --rm -p 8000:8000 "
+              f"{os.environ['IMAGE_NAME']}:latest",
+          )
+          print("===== MULTI-ARCH IMAGE SUCCESS =====")
+          PY
+
+      - name: Smoke-test published Arm64 variant
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          set -euxo pipefail
+
+          docker pull \
+            --platform linux/arm64 \
+            "$IMAGE_NAME:latest"
+
+          docker run \
+            --detach \
+            --name mosaic-multiarch-arm64-test \
+            --publish 127.0.0.1:8003:8000 \
+            "$IMAGE_NAME:latest"
+
+          cleanup() {
+            docker logs mosaic-multiarch-arm64-test || true
+            docker rm --force mosaic-multiarch-arm64-test || true
+          }
+
+          trap cleanup EXIT
+
+          READY=false
+
+          for attempt in $(seq 1 30); do
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://127.0.0.1:8003/health \
+              > multiarch-health.json
+            then
+              READY=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [[ "$READY" != "true" ]]; then
+            echo "Published Arm64 variant failed its smoke test."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          health = json.loads(
+              Path("multiarch-health.json").read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          if health["status"] != "ok":
+              raise AssertionError(
+                  f"Unexpected health response: {health}"
+              )
+
+          print("Published Arm64 variant health: ok")
+          PY
