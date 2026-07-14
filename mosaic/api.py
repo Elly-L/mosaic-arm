@@ -18,6 +18,12 @@ from mosaic.decision_engine import (
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
+DASHBOARD_PATH = (
+    REPOSITORY_ROOT
+    / "mosaic"
+    / "static"
+    / "index.html"
+)
 
 class RecommendRequest(BaseModel):
     """Optimization request submitted by an API client."""
@@ -140,6 +146,39 @@ def load_current_dataset() -> dict[str, Any]:
             },
         ) from error
 
+
+@app.get(
+    "/",
+    tags=["Dashboard"],
+    summary="Open the MOSAIC dashboard",
+    include_in_schema=False,
+    response_class=FileResponse,
+)
+@app.get(
+    "/dashboard",
+    tags=["Dashboard"],
+    summary="Open the MOSAIC dashboard",
+    include_in_schema=False,
+    response_class=FileResponse,
+)
+def dashboard() -> FileResponse:
+    if not DASHBOARD_PATH.exists():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "dashboard_not_found",
+                "message": (
+                    "The MOSAIC dashboard file "
+                    "is unavailable."
+                ),
+                "path": str(DASHBOARD_PATH),
+            },
+        )
+
+    return FileResponse(
+        path=DASHBOARD_PATH,
+        media_type="text/html",
+    )
 
 @app.get(
     "/health",
