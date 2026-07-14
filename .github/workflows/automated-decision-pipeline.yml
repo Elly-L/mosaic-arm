@@ -519,6 +519,283 @@ jobs:
               "===== OPTIMIZATION PROOF REPORT SUCCESS ====="
           )
           PY
+
+
+      - name: Install MOSAIC API dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 -m pip install \
+            --disable-pip-version-check \
+            -r requirements-api.txt
+
+          python3 -c \
+            "import fastapi, uvicorn; print('FastAPI:', fastapi.__version__); print('Uvicorn:', uvicorn.__version__)"
+
+      - name: Test MOSAIC API
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p generated/api-tests
+
+          export MOSAIC_CANDIDATES_PATH="$PWD/generated/candidates.json"
+          export MOSAIC_REPORT_HTML_PATH="$PWD/generated/report/optimization-proof-report.html"
+
+          python3 -m uvicorn mosaic.api:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > generated/api-tests/server.log \
+            2>&1 &
+
+          API_PID=$!
+
+          cleanup() {
+            kill "$API_PID" 2>/dev/null || true
+            wait "$API_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          API_READY=false
+
+          for attempt in $(seq 1 30); do
+            if curl \
+              --fail \
+              --silent \
+              --show-error \
+              http://127.0.0.1:8000/health \
+              > generated/api-tests/health.json
+            then
+              API_READY=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [[ "$API_READY" != "true" ]]; then
+            echo "MOSAIC API failed to become ready."
+            cat generated/api-tests/server.log
+            exit 1
+          fi
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1:8000/api/candidates \
+            > generated/api-tests/candidates.json
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data '{
+              "objective": "latency",
+              "quality_floor_percent": 50
+            }' \
+            http://127.0.0.1:8000/api/recommend \
+            > generated/api-tests/latency-quality-50.json
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --request POST \
+            --header "Content-Type: application/json" \
+            --data '{
+              "objective": "latency",
+              "quality_floor_percent": 60
+            }' \
+            http://127.0.0.1:8000/api/recommend \
+            > generated/api-tests/latency-quality-60.json
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            http://127.0.0.1:8000/api/report \
+            > generated/api-tests/report.html
+
+          INVALID_STATUS="$(
+            curl \
+              --silent \
+              --output generated/api-tests/invalid-request.json \
+              --write-out "%{http_code}" \
+              --request POST \
+              --header "Content-Type: application/json" \
+              --data '{
+                "objective": "speed-at-all-costs",
+                "quality_floor_percent": 50
+              }' \
+              http://127.0.0.1:8000/api/recommend
+          )"
+
+          echo "$INVALID_STATUS" \
+            > generated/api-tests/invalid-status.txt
+
+          if [[ "$INVALID_STATUS" != "422" ]]; then
+            echo "Expected invalid request to return 422, received $INVALID_STATUS"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          directory = Path("generated/api-tests")
+
+          def load(name):
+              return json.loads(
+                  (directory / name).read_text(
+                      encoding="utf-8"
+                  )
+              )
+
+          health = load("health.json")
+          candidates = load("candidates.json")
+          quality_50 = load("latency-quality-50.json")
+          quality_60 = load("latency-quality-60.json")
+          invalid = load("invalid-request.json")
+
+          if health["status"] != "ok":
+              raise AssertionError(
+                  f"API health is not OK: {health}"
+              )
+
+          if health["candidate_count"] != 3:
+              raise AssertionError(
+                  "Expected three API candidates."
+              )
+
+          if not health["report_available"]:
+              raise AssertionError(
+                  "Expected proof report to be available."
+              )
+
+          if candidates["candidate_count"] != 3:
+              raise AssertionError(
+                  "Candidate endpoint returned an unexpected count."
+              )
+
+          quantizations = {
+              candidate["quantization"]
+              for candidate in candidates["candidates"]
+          }
+
+          if quantizations != {
+              "Q4_K_M",
+              "Q5_K_M",
+              "Q8_0",
+          }:
+              raise AssertionError(
+                  f"Unexpected quantizations: {quantizations}"
+              )
+
+          selected_50 = quality_50[
+              "selected_configuration"
+          ]
+
+          if (
+              selected_50 is None
+              or selected_50["id"]
+              != "smollm2-1.7b-q8-0"
+          ):
+              raise AssertionError(
+                  "The 50% latency request should select Q8_0."
+              )
+
+          selected_60 = quality_60[
+              "selected_configuration"
+          ]
+
+          if (
+              selected_60 is None
+              or selected_60["id"]
+              != "smollm2-1.7b-q4-k-m"
+          ):
+              raise AssertionError(
+                  "The 60% latency request should select Q4_K_M."
+              )
+
+          if not any(
+              rejected["id"]
+              == "smollm2-1.7b-q8-0"
+              and rejected["reason"]
+              == "below_quality_floor"
+              for rejected in quality_60[
+                  "rejected_candidates"
+              ]
+          ):
+              raise AssertionError(
+                  "Q8_0 should be rejected at the 60% quality floor."
+              )
+
+          report_path = directory / "report.html"
+          report = report_path.read_text(
+              encoding="utf-8"
+          )
+
+          if report_path.stat().st_size < 500:
+              raise AssertionError(
+                  "Downloaded report is too small."
+              )
+
+          if (
+              "MOSAIC-Arm Optimization Proof Report"
+              not in report
+          ):
+              raise AssertionError(
+                  "Downloaded report content is invalid."
+              )
+
+          invalid_status = (
+              directory
+              / "invalid-status.txt"
+          ).read_text().strip()
+
+          if invalid_status != "422":
+              raise AssertionError(
+                  "Invalid objective did not return 422."
+              )
+
+          if "detail" not in invalid:
+              raise AssertionError(
+                  "Validation error response is malformed."
+              )
+
+          print("===== MOSAIC API SUMMARY =====")
+          print("Health:", health["status"])
+          print(
+              "Candidates:",
+              candidates["candidate_count"],
+          )
+          print(
+              "Latency, quality >= 50%:",
+              selected_50["id"],
+          )
+          print(
+              "Latency, quality >= 60%:",
+              selected_60["id"],
+          )
+          print(
+              "Invalid objective status:",
+              invalid_status,
+          )
+          print(
+              "Report bytes:",
+              report_path.stat().st_size,
+          )
+          print("===== MOSAIC API SUCCESS =====")
+          PY
+
+          echo ""
+          echo "===== API SERVER LOG ====="
+          cat generated/api-tests/server.log
       
       - name: Upload generated dataset and decisions
         uses: actions/upload-artifact@v4
