@@ -1,0 +1,306 @@
+name: Automated MOSAIC Pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  generate-and-select:
+    name: Generate candidates and select profiles
+    runs-on: ubuntu-24.04-arm
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify required files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -f mosaic/build_candidates.py
+          test -f mosaic/decision_engine.py
+
+          python3 --version
+          gh --version
+
+      - name: Find latest successful source runs
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          QUANTIZATION_RUN_ID="$(
+            gh run list \
+              --workflow quantization-study.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId'
+          )"
+
+          QUALITY_RUN_ID="$(
+            gh run list \
+              --workflow quality-output-study.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId'
+          )"
+
+          if [[ -z "$QUANTIZATION_RUN_ID" ]]; then
+            echo "No successful Quantization Study run found."
+            exit 1
+          fi
+
+          if [[ -z "$QUALITY_RUN_ID" ]]; then
+            echo "No successful Quality Output Study run found."
+            exit 1
+          fi
+
+          echo \
+            "QUANTIZATION_RUN_ID=$QUANTIZATION_RUN_ID" \
+            >> "$GITHUB_ENV"
+
+          echo \
+            "QUALITY_RUN_ID=$QUALITY_RUN_ID" \
+            >> "$GITHUB_ENV"
+
+          echo "===== SOURCE WORKFLOW RUNS ====="
+          echo \
+            "Quantization run: $QUANTIZATION_RUN_ID"
+          echo \
+            "Quality run: $QUALITY_RUN_ID"
+
+      - name: Download latest measurement artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p \
+            imported/quantization \
+            imported/quality
+
+          gh run download \
+            "$QUANTIZATION_RUN_ID" \
+            --name smollm2-1.7b-quantization-study \
+            --dir imported/quantization
+
+          gh run download \
+            "$QUALITY_RUN_ID" \
+            --name smollm2-q4-vs-q8-quality-outputs \
+            --dir imported/quality
+
+          echo "===== DOWNLOADED FILES ====="
+          find imported -type f | sort
+
+          find imported/quantization \
+            -name quantization-summary.csv \
+            -print \
+            -quit \
+            | grep -q .
+
+          find imported/quality \
+            -name quality-score-summary.csv \
+            -print \
+            -quit \
+            | grep -q .
+
+      - name: Generate candidate dataset
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 mosaic/build_candidates.py \
+            --quantization-dir imported/quantization \
+            --quality-dir imported/quality \
+            --quantization-run-id \
+              "$QUANTIZATION_RUN_ID" \
+            --quality-run-id \
+              "$QUALITY_RUN_ID" \
+            --output generated/candidates.json
+
+          echo ""
+          echo "===== GENERATED DATASET ====="
+          cat generated/candidates.json
+
+      - name: Validate generated measurements
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          dataset = json.loads(
+              Path(
+                  "generated/candidates.json"
+              ).read_text()
+          )
+
+          candidates = {
+              candidate["quantization"]: candidate
+              for candidate in dataset["candidates"]
+          }
+
+          expected_quantizations = {
+              "Q4_K_M",
+              "Q5_K_M",
+              "Q8_0",
+          }
+
+          if set(candidates) != expected_quantizations:
+              raise AssertionError(
+                  "Unexpected candidate set: "
+                  f"{set(candidates)}"
+              )
+
+          if candidates["Q4_K_M"][
+              "strict_quality_percent"
+          ] != 62.5:
+              raise AssertionError(
+                  "Unexpected Q4 quality score."
+              )
+
+          if candidates["Q8_0"][
+              "strict_quality_percent"
+          ] != 50.0:
+              raise AssertionError(
+                  "Unexpected Q8 quality score."
+              )
+
+          if candidates["Q5_K_M"][
+              "strict_quality_percent"
+          ] is not None:
+              raise AssertionError(
+                  "Q5 should have no quality evidence yet."
+              )
+
+          for candidate in candidates.values():
+              if candidate["model_size_mib"] <= 0:
+                  raise AssertionError(
+                      "Invalid model size."
+                  )
+
+              if (
+                  candidate[
+                      "prompt_tokens_per_second"
+                  ]
+                  <= 0
+              ):
+                  raise AssertionError(
+                      "Invalid prompt throughput."
+                  )
+
+              if (
+                  candidate[
+                      "generation_tokens_per_second"
+                  ]
+                  <= 0
+              ):
+                  raise AssertionError(
+                      "Invalid generation throughput."
+                  )
+
+          print(
+              "Generated measurements validated."
+          )
+          PY
+
+      - name: Run decision engine on generated data
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p generated/decisions
+
+          for objective in latency memory balanced; do
+            python3 mosaic/decision_engine.py \
+              --data generated/candidates.json \
+              --objective "$objective" \
+              --quality-floor 50 \
+              --output \
+                "generated/decisions/${objective}-quality-50.json"
+          done
+
+          python3 mosaic/decision_engine.py \
+            --data generated/candidates.json \
+            --objective latency \
+            --quality-floor 60 \
+            --output \
+              generated/decisions/latency-quality-60.json
+
+      - name: Validate automated selections
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          directory = Path(
+              "generated/decisions"
+          )
+
+          expected = {
+              "latency-quality-50.json":
+                  "smollm2-1.7b-q8-0",
+              "memory-quality-50.json":
+                  "smollm2-1.7b-q4-k-m",
+              "balanced-quality-50.json":
+                  "smollm2-1.7b-q8-0",
+              "latency-quality-60.json":
+                  "smollm2-1.7b-q4-k-m",
+          }
+
+          print(
+              "===== AUTOMATED MOSAIC SUMMARY ====="
+          )
+
+          for filename, expected_id in expected.items():
+              result = json.loads(
+                  (directory / filename).read_text()
+              )
+
+              selected = result[
+                  "selected_configuration"
+              ]
+
+              if selected is None:
+                  raise AssertionError(
+                      f"{filename}: no selection"
+                  )
+
+              actual_id = selected["id"]
+
+              if actual_id != expected_id:
+                  raise AssertionError(
+                      f"{filename}: expected "
+                      f"{expected_id}, received "
+                      f"{actual_id}"
+                  )
+
+              print(
+                  f"{filename}: "
+                  f"{actual_id} "
+                  f"({selected['quantization']})"
+              )
+
+          print(
+              "===== AUTOMATED PIPELINE SUCCESS ====="
+          )
+          PY
+
+      - name: Upload generated dataset and decisions
+        uses: actions/upload-artifact@v4
+        with:
+          name: mosaic-automated-results
+          path: generated/
+          if-no-files-found: error
