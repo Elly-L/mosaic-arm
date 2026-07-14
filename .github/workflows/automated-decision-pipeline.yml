@@ -585,6 +585,13 @@ jobs:
             --fail \
             --silent \
             --show-error \
+            http://127.0.0.1:8000/ \
+            > generated/api-tests/dashboard.html
+          
+          curl \
+            --fail \
+            --silent \
+            --show-error \
             http://127.0.0.1:8000/api/candidates \
             > generated/api-tests/candidates.json
 
