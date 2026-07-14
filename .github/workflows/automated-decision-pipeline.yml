@@ -26,6 +26,11 @@ jobs:
 
           test -f mosaic/build_candidates.py
           test -f mosaic/decision_engine.py
+          test -f mosaic/generate_report.py
+          test -f mosaic/api.py
+          test -f mosaic/__init__.py
+          test -f mosaic/static/index.html
+          test -f requirements-api.txt
 
           python3 --version
           gh --version
@@ -742,6 +747,35 @@ jobs:
                   "Q8_0 should be rejected at the 60% quality floor."
               )
 
+          dashboard_path = (
+              directory / "dashboard.html"
+          )
+
+          dashboard = dashboard_path.read_text(
+              encoding="utf-8"
+          )
+
+          if dashboard_path.stat().st_size < 5000:
+              raise AssertionError(
+                  "Dashboard HTML is unexpectedly small."
+              )
+
+          required_dashboard_fragments = (
+              "MOSAIC-Arm Optimizer",
+              "Optimization request",
+              "Measured candidates",
+              "/api/recommend",
+              "/api/candidates",
+              "Find optimal configuration",
+          )
+
+          for fragment in required_dashboard_fragments:
+              if fragment not in dashboard:
+                  raise AssertionError(
+                      "Dashboard is missing required "
+                      f"content: {fragment}"
+                  )
+
           report_path = directory / "report.html"
           report = report_path.read_text(
               encoding="utf-8"
@@ -792,6 +826,10 @@ jobs:
           print(
               "Invalid objective status:",
               invalid_status,
+          )
+          print(
+              "Dashboard bytes:",
+              dashboard_path.stat().st_size,
           )
           print(
               "Report bytes:",
