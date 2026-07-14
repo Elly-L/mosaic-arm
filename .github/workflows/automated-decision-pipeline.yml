@@ -298,6 +298,228 @@ jobs:
           )
           PY
 
+      - name: Generate Optimization Proof Report
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 mosaic/generate_report.py \
+            --candidates generated/candidates.json \
+            --decisions-dir generated/decisions \
+            --markdown \
+              generated/report/optimization-proof-report.md \
+            --html \
+              generated/report/optimization-proof-report.html \
+            --summary-json \
+              generated/report/optimization-proof-summary.json
+     
+      - name: Validate Optimization Proof Report
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_dir = Path("generated/report")
+
+          markdown_path = (
+              report_dir
+              / "optimization-proof-report.md"
+          )
+
+          html_path = (
+              report_dir
+              / "optimization-proof-report.html"
+          )
+
+          summary_path = (
+              report_dir
+              / "optimization-proof-summary.json"
+          )
+
+          for path in (
+              markdown_path,
+              html_path,
+              summary_path,
+          ):
+              if not path.exists():
+                  raise AssertionError(
+                      f"Missing report artifact: {path}"
+                  )
+
+              if path.stat().st_size < 500:
+                  raise AssertionError(
+                      f"Report artifact is unexpectedly small: {path}"
+                  )
+
+          markdown = markdown_path.read_text(
+              encoding="utf-8"
+          )
+
+          html = html_path.read_text(
+              encoding="utf-8"
+          )
+
+          summary = json.loads(
+              summary_path.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+          required_markdown_sections = (
+              "# MOSAIC-Arm Optimization Proof Report",
+              "## Test environment",
+              "## Candidate evidence",
+              "## Automated decisions",
+              "## Quality-floor behavior",
+              "## Reproducibility evidence",
+              "## Interpretation limits",
+          )
+
+          for section in required_markdown_sections:
+              if section not in markdown:
+                  raise AssertionError(
+                      f"Missing Markdown section: {section}"
+                  )
+
+          required_html_fragments = (
+              "<!doctype html>",
+              "MOSAIC-Arm Optimization Proof Report",
+              "Candidate evidence",
+              "Automated decisions",
+              "Reproducibility evidence",
+          )
+
+          for fragment in required_html_fragments:
+              if fragment not in html:
+                  raise AssertionError(
+                      f"Missing HTML content: {fragment}"
+                  )
+
+          expected = {
+              ("latency", 50.0):
+                  "smollm2-1.7b-q8-0",
+              ("memory", 50.0):
+                  "smollm2-1.7b-q4-k-m",
+              ("balanced", 50.0):
+                  "smollm2-1.7b-q8-0",
+              ("latency", 60.0):
+                  "smollm2-1.7b-q4-k-m",
+          }
+
+          actual = {
+              (
+                  decision["objective"],
+                  float(
+                      decision[
+                          "quality_floor_percent"
+                      ]
+                  ),
+              ): decision["selected_id"]
+              for decision in summary["decisions"]
+          }
+
+          if actual != expected:
+              raise AssertionError(
+                  f"Unexpected report decisions: {actual}"
+              )
+
+          comparison = summary["q8_vs_q4"]
+
+          if (
+              comparison[
+                  "prompt_throughput_change_percent"
+              ]
+              <= 0
+          ):
+              raise AssertionError(
+                  "Expected Q8 prompt throughput "
+                  "to exceed Q4."
+              )
+
+          if (
+              comparison[
+                  "generation_throughput_change_percent"
+              ]
+              <= 0
+          ):
+              raise AssertionError(
+                  "Expected Q8 generation throughput "
+                  "to exceed Q4."
+              )
+
+          if (
+              comparison[
+                  "quality_change_percentage_points"
+              ]
+              >= 0
+          ):
+              raise AssertionError(
+                  "Expected Q8 strict quality "
+                  "to be below Q4."
+              )
+
+          print(
+              "===== OPTIMIZATION PROOF SUMMARY ====="
+          )
+
+          print(
+              "Markdown:",
+              markdown_path,
+              markdown_path.stat().st_size,
+              "bytes",
+          )
+
+          print(
+              "HTML:",
+              html_path,
+              html_path.stat().st_size,
+              "bytes",
+          )
+
+          print(
+              "Summary JSON:",
+              summary_path,
+              summary_path.stat().st_size,
+              "bytes",
+          )
+
+          print(
+              "Q8 vs Q4 size:",
+              f"{comparison['model_size_change_percent']:+.2f}%",
+          )
+
+          print(
+              "Q8 vs Q4 prompt throughput:",
+              f"{comparison['prompt_throughput_change_percent']:+.2f}%",
+          )
+
+          print(
+              "Q8 vs Q4 generation throughput:",
+              f"{comparison['generation_throughput_change_percent']:+.2f}%",
+          )
+
+          print(
+              "Q8 vs Q4 strict quality:",
+              f"{comparison['quality_change_percentage_points']:+.2f}",
+              "percentage points",
+          )
+
+          for decision in summary["decisions"]:
+              print(
+                  f"{decision['objective']} | "
+                  f"quality >= "
+                  f"{decision['quality_floor_percent']}% | "
+                  f"{decision['selected_id']}"
+              )
+
+          print(
+              "===== OPTIMIZATION PROOF REPORT SUCCESS ====="
+          )
+          PY
+      
       - name: Upload generated dataset and decisions
         uses: actions/upload-artifact@v4
         with:
