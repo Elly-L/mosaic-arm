@@ -1,0 +1,43 @@
+{
+  "hardware": {
+    "architecture": "aarch64",
+    "cpu": "Arm Neoverse-N2",
+    "cores": 4,
+    "memory_gib": 15
+  },
+  "workload": {
+    "model_family": "SmolLM2-1.7B-Instruct",
+    "prompt_tokens": 128,
+    "generation_tokens": 64,
+    "threads": 4
+  },
+  "candidates": [
+    {
+      "id": "smollm2-1.7b-q4-k-m",
+      "quantization": "Q4_K_M",
+      "kleidiai": true,
+      "model_size_mib": 1005.01,
+      "prompt_tokens_per_second": 93.6158,
+      "generation_tokens_per_second": 31.5912,
+      "strict_quality_percent": 62.5
+    },
+    {
+      "id": "smollm2-1.7b-q5-k-m",
+      "quantization": "Q5_K_M",
+      "kleidiai": true,
+      "model_size_mib": 1167.01,
+      "prompt_tokens_per_second": 77.6246,
+      "generation_tokens_per_second": 22.6295,
+      "strict_quality_percent": null
+    },
+    {
+      "id": "smollm2-1.7b-q8-0",
+      "quantization": "Q8_0",
+      "kleidiai": true,
+      "model_size_mib": 1734.38,
+      "prompt_tokens_per_second": 273.0461,
+      "generation_tokens_per_second": 40.3398,
+      "strict_quality_percent": 50.0
+    }
+  ]
+}
